@@ -3,7 +3,7 @@
 Только стандартная библиотека. Подкоманды:
 
     seed   - добавить автомат, товары и нулевые остатки в SQLite-файл
-    run    - непрерывная имитация: heartbeat, продажи, загрузка, ошибки
+    run    - heartbeat по таймеру; клавиши 1-9 генерируют события
     check  - детерминированный набор проверок API (в т.ч. негативных)
 
 Настройка через переменные окружения или аргументы:
@@ -17,16 +17,18 @@
 
     uv run python -m mta_project.vending_emulator seed
     MTA_DEVICE_KEY=... uv run python -m mta_project.vending_emulator check
-    MTA_DEVICE_KEY=... uv run python -m mta_project.vending_emulator run --duration 60
+    MTA_DEVICE_KEY=... uv run python -m mta_project.vending_emulator run --heartbeat 5
 """
 
 import argparse
 import json
 import os
-import random
+import select
 import sqlite3
 import sys
+import termios
 import time
+import tty
 import urllib.error
 import urllib.request
 import uuid
@@ -39,7 +41,7 @@ DEFAULT_PRODUCTS = {
     "CHOCO": ("Chocolate bar", 100),
 }
 ERROR_CODES = ("COIN_JAM", "DISPENSER_STUCK", "COOLING_FAIL")
-INITIAL_STOCK = 10
+LOAD_QUANTITY = 10
 
 
 def now_iso():
@@ -56,7 +58,6 @@ class Machine:
         self.timeout = timeout
         self.state = "IDLE"
         self.active_errors = []  # открытые коды ошибок, самая свежая последней
-        self.stock = {}
         self.prices = {}
 
     # --- транспорт ---------------------------------------------------------
@@ -113,18 +114,12 @@ class Machine:
     # --- действия автомата -------------------------------------------------
 
     def load(self, product_id, quantity):
-        result = self.event("LOAD", {"product_id": product_id,
-                                     "quantity": quantity})
-        if result[1] == 200:
-            self.stock[product_id] = self.stock.get(product_id, 0) + quantity
-        return result
+        return self.event("LOAD", {"product_id": product_id,
+                                   "quantity": quantity})
 
     def unload(self, product_id, quantity):
-        result = self.event("UNLOAD", {"product_id": product_id,
-                                       "quantity": quantity})
-        if result[1] == 200:
-            self.stock[product_id] -= quantity
-        return result
+        return self.event("UNLOAD", {"product_id": product_id,
+                                     "quantity": quantity})
 
     def sell(self, product_id):
         self.state = "SELLING"
@@ -134,8 +129,6 @@ class Machine:
             "payment": "SUCCESS",
             "dispense": "SUCCESS",
         }, session_id=str(uuid.uuid4()))
-        if result[1] == 200:
-            self.stock[product_id] -= 1
         self.state = "ERROR" if self.active_errors else "IDLE"
         return result
 
@@ -204,56 +197,85 @@ def report(label, result):
     log("{:<12} -> {} {}".format(label, status, answer))
 
 
+PRODUCT_KEYS = dict(zip("1234", DEFAULT_PRODUCTS))
+HELP = """\
+клавиши (Enter не нужен):
+  1-4  SALE: COLA, WATER, CHIPS, CHOCO
+  5    LOAD: +{} шт. каждого товара
+  6    повтор последней продажи (тот же event_id)
+  7    ERROR_SET: следующий код из {}
+  8    ERROR_CLEAR: снять последнюю ошибку
+  9    UNLOAD: -1 шт. каждого товара
+  h    эта справка, q - выход""".format(LOAD_QUANTITY, ", ".join(ERROR_CODES))
+
+
+def handle_key(machine, key, last_sale):
+    """Выполнить действие клавиши; вернуть тело последней продажи."""
+    if key in PRODUCT_KEYS:
+        result = machine.sell(PRODUCT_KEYS[key])
+        report("SALE " + PRODUCT_KEYS[key], result)
+        return result[0]
+    if key == "5":
+        for product_id in DEFAULT_PRODUCTS:
+            report("LOAD " + product_id, machine.load(product_id, LOAD_QUANTITY))
+    elif key == "6":
+        if last_sale is None:
+            log("нет продажи для повтора")
+        else:
+            report("SALE retry", machine.event(
+                "SALE", last_sale["data"], session_id=last_sale["session_id"],
+                event_id=last_sale["event_id"],
+                created_at=last_sale["created_at"]))
+    elif key == "7":
+        free = [c for c in ERROR_CODES if c not in machine.active_errors]
+        if free:
+            report("ERROR_SET " + free[0], machine.set_error(free[0]))
+        else:
+            log("все коды ошибок уже активны")
+    elif key == "8":
+        if machine.active_errors:
+            code = machine.active_errors[-1]
+            report("ERROR_CLEAR " + code, machine.clear_error(code))
+        else:
+            log("активных ошибок нет")
+    elif key == "9":
+        for product_id in DEFAULT_PRODUCTS:
+            report("UNLOAD " + product_id, machine.unload(product_id, 1))
+    return last_sale
+
+
 def cmd_run(args):
-    rng = random.Random(args.seed)
     machine = make_machine(args)
-
-    status, answer = machine.heartbeat()
-    log("heartbeat    -> {} {}".format(status, answer))
-    if status != 200:
-        sys.exit("server rejected heartbeat; check URL, key and seed")
-
-    for product_id in DEFAULT_PRODUCTS:
-        report("LOAD " + product_id, machine.load(product_id, INITIAL_STOCK))
-
-    deadline = time.monotonic() + args.duration if args.duration else None
+    interactive = sys.stdin.isatty()
+    saved = termios.tcgetattr(sys.stdin) if interactive else None
+    last_sale = None
     next_heartbeat = 0.0
+    print(HELP)
     try:
-        while deadline is None or time.monotonic() < deadline:
+        if interactive:
+            tty.setcbreak(sys.stdin.fileno())
+        while True:
             if time.monotonic() >= next_heartbeat:
                 status, answer = machine.heartbeat()
                 log("heartbeat    -> {} {} state={}".format(
                     status, answer, machine.state))
                 next_heartbeat = time.monotonic() + args.heartbeat
-
-            roll = rng.random()
-            in_stock = [p for p, q in machine.stock.items() if q > 0]
-            if machine.active_errors and roll < 0.3:
-                code = rng.choice(machine.active_errors)
-                report("ERROR_CLEAR", machine.clear_error(code))
-            elif roll < args.error_rate:
-                free = [c for c in ERROR_CODES if c not in machine.active_errors]
-                if free:
-                    report("ERROR_SET", machine.set_error(rng.choice(free)))
-            elif not in_stock:
-                product_id = rng.choice(list(DEFAULT_PRODUCTS))
-                report("LOAD " + product_id, machine.load(product_id, INITIAL_STOCK))
-            elif machine.active_errors:
-                pass  # неисправный автомат ничего не продаёт
+            wait = max(0.0, next_heartbeat - time.monotonic())
+            if not select.select([sys.stdin], [], [], wait)[0]:
+                continue
+            key = os.read(sys.stdin.fileno(), 1).decode(errors="ignore")
+            if key in ("q", "\x03", ""):  # q, Ctrl+C, EOF
+                break
+            if key == "h":
+                print(HELP)
             else:
-                product_id = rng.choice(in_stock)
-                result = machine.sell(product_id)
-                report("SALE " + product_id, result)
-                if rng.random() < args.duplicate_rate:
-                    body, _s, _a = result
-                    again = machine.event(
-                        "SALE", body["data"], session_id=body["session_id"],
-                        event_id=body["event_id"], created_at=body["created_at"])
-                    report("SALE retry", again)
-
-            time.sleep(args.interval)
+                last_sale = handle_key(machine, key, last_sale) or last_sale
     except KeyboardInterrupt:
-        log("stopped")
+        pass
+    finally:
+        if interactive:
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, saved)
+    log("stopped")
 
 
 # --- check -----------------------------------------------------------------
@@ -377,19 +399,10 @@ def main(argv=None):
     seed.add_argument("--db", default=os.getenv("MTA_DB_PATH", "mta.db"))
     seed.set_defaults(func=cmd_seed)
 
-    run = sub.add_parser("run", help="непрерывная имитация работы")
-    run.add_argument("--duration", type=float, default=0,
-                     help="секунды работы; 0 - до Ctrl+C")
-    run.add_argument("--interval", type=float, default=1.0,
-                     help="пауза между действиями, с")
+    run = sub.add_parser(
+        "run", help="heartbeat по таймеру; клавиши 1-9 шлют события")
     run.add_argument("--heartbeat", type=float, default=10.0,
                      help="период heartbeat, с")
-    run.add_argument("--error-rate", type=float, default=0.05,
-                     help="вероятность ошибки на шаг")
-    run.add_argument("--duplicate-rate", type=float, default=0.1,
-                     help="вероятность повторной отправки продажи")
-    run.add_argument("--seed", type=int, default=None,
-                     help="seed генератора случайных чисел")
     run.set_defaults(func=cmd_run)
 
     check = sub.add_parser("check", help="набор проверок API")

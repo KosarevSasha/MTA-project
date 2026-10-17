@@ -24,10 +24,10 @@ MTA-project/
 ├── mta_schema.sql          # базовая схема БД
 ├── mta_errors.sql          # расширение схемы: таблица device_errors
 ├── mta.db                  # SQLite-база (закоммичена как временная)
+├── .env.example            # шаблон конфигурации (рабочий .env в git не попадает)
 └── src/mta_project/
     ├── __init__.py         # пустой
     ├── mta_server.py       # FastAPI-приложение
-    ├── start_mta_server.py # локальный интерактивный лаунчер
     └── vending_emulator.py # эмулятор торгового автомата (п. 6)
 ```
 
@@ -132,16 +132,24 @@ FastAPI-приложение; Swagger, ReDoc и OpenAPI отключены. Со
 
 ## 5. Запуск
 
-`start_mta_server.py` — интерактивный лаунчер для локального тестирования
-(для интернета не предназначен):
+Конфигурация хранится в файле `.env` (в `.gitignore`); шаблон — `.env.example`.
 
-- ключ устройства `MTA-001` (≥ 32 символов) и пароль администратора
-  (≥ 20 символов) читаются из буфера обмена через `tkinter` (из KeePassXC);
-- вычисляются PBKDF2-хеш (310 000 раундов, случайная соль) и случайный
-  `MTA_SESSION_SECRET`;
-- сервер стартует через `uvicorn` на `http://127.0.0.1:8001/login`.
+1. `cp .env.example .env`
+2. Вписать ключ устройства в `MTA_DEVICE_KEYS`, сгенерировать
+   `MTA_SESSION_SECRET` (команда в шаблоне) и хеш пароля администратора
+   (пароль ≥ 20 символов, вводится без эха):
 
-Конфигурация задаётся переменными окружения:
+   ```
+   python -c "import hashlib,secrets,getpass; p=getpass.getpass().encode(); s=secrets.token_bytes(16); print('pbkdf2_sha256\$310000\$%s\$%s' % (s.hex(), hashlib.pbkdf2_hmac('sha256',p,s,310000).hex()))"
+   ```
+
+   Результат вписать в `MTA_ADMIN_PASSWORD_HASH` **в одинарных кавычках**:
+   без них `$` трактуется как подстановка переменных и хеш портится.
+3. `uv run --env-file .env uvicorn mta_project.mta_server:app`
+   — сервер на `http://127.0.0.1:8001/login` (хост и порт — `UVICORN_HOST`,
+   `UVICORN_PORT`). Для интернета не предназначен без HTTPS (`MTA_HTTPS=1`).
+
+Переменные окружения (задаются в `.env`):
 
 | Переменная | Значение |
 |---|---|
@@ -150,6 +158,7 @@ FastAPI-приложение; Swagger, ReDoc и OpenAPI отключены. Со
 | `MTA_SESSION_SECRET` | секрет подписи сессий, ≥ 40 символов |
 | `MTA_DB_PATH` | путь к SQLite-файлу (по умолчанию `mta.db`) |
 | `MTA_HTTPS` | `1` — включить флаг `Secure` для cookie |
+| `UVICORN_HOST`, `UVICORN_PORT` | адрес и порт `uvicorn` (читает сам `uvicorn`) |
 
 ## 6. Эмулятор торгового автомата (`vending_emulator.py`)
 
@@ -160,19 +169,29 @@ FastAPI-приложение; Swagger, ReDoc и OpenAPI отключены. Со
 uv run python -m mta_project.vending_emulator seed    # один раз
 export MTA_DEVICE_KEY=<ключ из MTA_DEVICE_KEYS>
 uv run python -m mta_project.vending_emulator check
-uv run python -m mta_project.vending_emulator run --interval 1
+uv run python -m mta_project.vending_emulator run
 ```
 
 | Подкоманда | Назначение |
 |---|---|
 | `seed` | добавляет в SQLite автомат, 4 товара (`COLA`, `WATER`, `CHIPS`, `CHOCO`) и нулевые остатки; остатки обязательны, иначе сервер отвечает на `LOAD` 400 «Inventory record not found» |
-| `run` | непрерывная имитация: начальный `LOAD` по 10 шт., heartbeat, случайные продажи, `ERROR_SET`/`ERROR_CLEAR`, дозагрузка при пустом остатке; при открытой ошибке продаж нет, состояние `ERROR` |
+| `run` | интерактивный режим: сам шлёт только heartbeat (по умолчанию каждые 10 с), события — по клавишам 1–9 |
 | `check` | детерминированный набор проверок API (код возврата 0/1) |
 
-Параметры `run`: `--duration` (с, 0 — до Ctrl+C), `--interval` (пауза
-между действиями), `--heartbeat` (период, по умолчанию 10 с),
-`--error-rate`, `--duplicate-rate` (доля повторных отправок продаж для
-проверки идемпотентности), `--seed` (воспроизводимость).
+Клавиши `run` (Enter не нужен; `h` — справка, `q` или Ctrl+C — выход):
+
+| Клавиша | Действие |
+|---|---|
+| `1`–`4` | `SALE`: `COLA`, `WATER`, `CHIPS`, `CHOCO` |
+| `5` | `LOAD`: +10 шт. каждого товара (после `seed` остатки нулевые, без загрузки продажи отклоняются) |
+| `6` | повтор последней продажи с тем же `event_id` (ожидается `already_accepted`) |
+| `7` | `ERROR_SET`: следующий неактивный код из `COIN_JAM`, `DISPENSER_STUCK`, `COOLING_FAIL` |
+| `8` | `ERROR_CLEAR`: снять последнюю ошибку |
+| `9` | `UNLOAD`: −1 шт. каждого товара |
+
+Состояние в heartbeat: `ERROR` при открытой ошибке, иначе `IDLE`.
+Параметр `run`: `--heartbeat` (период, с). Без терминала (pipe) клавиши
+читаются из stdin, на EOF эмулятор завершается.
 
 `check` проверяет: heartbeat без ключа и с неверным ключом (401);
 принятую продажу и её повтор (`already_accepted`); дубликат `session_id`,
@@ -190,13 +209,11 @@ uv run python -m mta_project.vending_emulator run --interval 1
 
 ## 7. Известные ограничения
 
-1. Скрипт `mta-project = "mta_project:main"` в `pyproject.toml` указывает на
-   несуществующую функцию (`__init__.py` пуст; лаунчер — `start_mta_server.main`).
-2. Файл `mta.db` закоммичен и не исключён в `.gitignore`.
-3. В `receive_event` вызов `logger.exception("Event database failure: ?", ...)`
+1. Файл `mta.db` закоммичен и не исключён в `.gitignore`.
+2. В `receive_event` вызов `logger.exception("Event database failure: ?", ...)`
    использует `?` вместо `%s`.
-4. Монитор жёстко привязан к `MTA-001`; единственный пользователь — `admin`.
-5. Счётчик попыток входа хранится в памяти процесса (не работает при нескольких воркерах).
-6. `GET /api/v1/devices/{id}` для неизвестного устройства возвращает 200 со
+3. Монитор жёстко привязан к `MTA-001`; единственный пользователь — `admin`.
+4. Счётчик попыток входа хранится в памяти процесса (не работает при нескольких воркерах).
+5. `GET /api/v1/devices/{id}` для неизвестного устройства возвращает 200 со
    `status: not_found`, а `/api/v1/monitor/{id}` — 404.
-7. Тестов, CI и миграций нет; схема восстановлена вручную по запросам сервера.
+6. Тестов, CI и миграций нет; схема восстановлена вручную по запросам сервера.
