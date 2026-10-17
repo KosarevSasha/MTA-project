@@ -7,7 +7,11 @@ authors = [
     { name = "syncro128", email = "git@auto.syn128.net" }
 ]
 requires-python = ">=3.14"
-dependencies = []
+dependencies = [
+    "fastapi>=0.143.3",
+    "python-multipart>=0.0.32",
+    "uvicorn>=0.54.0",
+]
 
 [project.scripts]
 mta-project = "mta_project:main"
