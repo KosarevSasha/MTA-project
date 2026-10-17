@@ -27,7 +27,8 @@ MTA-project/
 └── src/mta_project/
     ├── __init__.py         # пустой
     ├── mta_server.py       # FastAPI-приложение
-    └── start_mta_server.py # локальный интерактивный лаунчер
+    ├── start_mta_server.py # локальный интерактивный лаунчер
+    └── vending_emulator.py # эмулятор торгового автомата (п. 6)
 ```
 
 ## 3. Модель данных (SQLite)
@@ -150,7 +151,44 @@ FastAPI-приложение; Swagger, ReDoc и OpenAPI отключены. Со
 | `MTA_DB_PATH` | путь к SQLite-файлу (по умолчанию `mta.db`) |
 | `MTA_HTTPS` | `1` — включить флаг `Secure` для cookie |
 
-## 6. Известные ограничения
+## 6. Эмулятор торгового автомата (`vending_emulator.py`)
+
+Консольный клиент для тестирования сервера: имитирует автомат, который
+отправляет heartbeat и события. Только стандартная библиотека.
+
+```
+uv run python -m mta_project.vending_emulator seed    # один раз
+export MTA_DEVICE_KEY=<ключ из MTA_DEVICE_KEYS>
+uv run python -m mta_project.vending_emulator check
+uv run python -m mta_project.vending_emulator run --interval 1
+```
+
+| Подкоманда | Назначение |
+|---|---|
+| `seed` | добавляет в SQLite автомат, 4 товара (`COLA`, `WATER`, `CHIPS`, `CHOCO`) и нулевые остатки; остатки обязательны, иначе сервер отвечает на `LOAD` 400 «Inventory record not found» |
+| `run` | непрерывная имитация: начальный `LOAD` по 10 шт., heartbeat, случайные продажи, `ERROR_SET`/`ERROR_CLEAR`, дозагрузка при пустом остатке; при открытой ошибке продаж нет, состояние `ERROR` |
+| `check` | детерминированный набор проверок API (код возврата 0/1) |
+
+Параметры `run`: `--duration` (с, 0 — до Ctrl+C), `--interval` (пауза
+между действиями), `--heartbeat` (период, по умолчанию 10 с),
+`--error-rate`, `--duplicate-rate` (доля повторных отправок продаж для
+проверки идемпотентности), `--seed` (воспроизводимость).
+
+`check` проверяет: heartbeat без ключа и с неверным ключом (401);
+принятую продажу и её повтор (`already_accepted`); дубликат `session_id`,
+`payment=FAILED`, цену 0, неизвестный товар, `created_at` без часового
+пояса, неизвестный `event_type`, `UNLOAD` сверх остатка (всё — 400);
+цикл `ERROR_SET`/`ERROR_CLEAR`; неизвестное устройство.
+
+Общие параметры (флаг или переменная окружения): `--url` / `MTA_URL`
+(по умолчанию `http://127.0.0.1:8001`), `--device-id` / `MTA_DEVICE_ID`
+(`MTA-001`), `--key` / `MTA_DEVICE_KEY` (обязателен для `run` и `check`),
+`--db` / `MTA_DB_PATH` (только для `seed`, по умолчанию `mta.db`).
+
+Особенность сервера, зафиксированная в `check`: повторный `ERROR_SET` с тем
+же кодом при открытой ошибке принимается (200) как no-op.
+
+## 7. Известные ограничения
 
 1. Скрипт `mta-project = "mta_project:main"` в `pyproject.toml` указывает на
    несуществующую функцию (`__init__.py` пуст; лаунчер — `start_mta_server.main`).
