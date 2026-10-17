@@ -25,10 +25,13 @@ MTA-project/
 ├── mta_errors.sql          # расширение схемы: таблица device_errors
 ├── mta.db                  # SQLite-база (закоммичена как временная)
 ├── .env.example            # шаблон конфигурации (рабочий .env в git не попадает)
-└── src/mta_project/
-    ├── __init__.py         # пустой
-    ├── mta_server.py       # FastAPI-приложение
-    └── vending_emulator.py # эмулятор торгового автомата (п. 6)
+├── src/mta_project/
+│   ├── __init__.py         # пустой
+│   └── mta_server.py       # FastAPI-приложение
+└── tests/
+    ├── virtualmta.py       # виртуальный автомат + интерактивный эмулятор (п. 6)
+    ├── conftest.py         # фикстуры: тестовый сервер, БД, автомат
+    └── test_api.py         # pytest-тесты API
 ```
 
 ## 3. Модель данных (SQLite)
@@ -145,7 +148,7 @@ FastAPI-приложение; Swagger, ReDoc и OpenAPI отключены. Со
 
    Результат вписать в `MTA_ADMIN_PASSWORD_HASH` **в одинарных кавычках**:
    без них `$` трактуется как подстановка переменных и хеш портится.
-3. `uv run --env-file .env uvicorn mta_project.mta_server:app`
+3. `uv run server` (читает `.env`; другой файл: `uv run server --env-file other.env`; уже заданные переменные окружения имеют приоритет; по умолчанию `127.0.0.1:8001`)
    — сервер на `http://127.0.0.1:8001/login` (хост и порт — `UVICORN_HOST`,
    `UVICORN_PORT`). Для интернета не предназначен без HTTPS (`MTA_HTTPS=1`).
 
@@ -158,25 +161,24 @@ FastAPI-приложение; Swagger, ReDoc и OpenAPI отключены. Со
 | `MTA_SESSION_SECRET` | секрет подписи сессий, ≥ 40 символов |
 | `MTA_DB_PATH` | путь к SQLite-файлу (по умолчанию `mta.db`) |
 | `MTA_HTTPS` | `1` — включить флаг `Secure` для cookie |
-| `UVICORN_HOST`, `UVICORN_PORT` | адрес и порт `uvicorn` (читает сам `uvicorn`) |
+| `UVICORN_HOST`, `UVICORN_PORT` | адрес и порт для `uv run server` (по умолчанию `127.0.0.1` и `8001`) |
 
-## 6. Эмулятор торгового автомата (`vending_emulator.py`)
+## 6. Эмулятор торгового автомата (`tests/virtualmta.py`)
 
-Консольный клиент для тестирования сервера: имитирует автомат, который
-отправляет heartbeat и события. Только стандартная библиотека.
+Консольный клиент для ручной проверки сервера: скрипт `virtualmta.py`
+(тот же класс `VirtualMTA`, что и в тестах) отправляет heartbeat и события по нажатию клавиш. Автоматические проверки
+API — в `tests/test_api.py` (`uv run --group test pytest`).
 
 ```
-uv run python -m mta_project.vending_emulator seed    # один раз
+uv run python tests/virtualmta.py seed    # один раз
 export MTA_DEVICE_KEY=<ключ из MTA_DEVICE_KEYS>
-uv run python -m mta_project.vending_emulator check
-uv run python -m mta_project.vending_emulator run
+uv run python tests/virtualmta.py run
 ```
 
 | Подкоманда | Назначение |
 |---|---|
 | `seed` | добавляет в SQLite автомат, 4 товара (`COLA`, `WATER`, `CHIPS`, `CHOCO`) и нулевые остатки; остатки обязательны, иначе сервер отвечает на `LOAD` 400 «Inventory record not found» |
 | `run` | интерактивный режим: сам шлёт только heartbeat (по умолчанию каждые 10 с), события — по клавишам 1–9 |
-| `check` | детерминированный набор проверок API (код возврата 0/1) |
 
 Клавиши `run` (Enter не нужен; `h` — справка, `q` или Ctrl+C — выход):
 
@@ -189,31 +191,7 @@ uv run python -m mta_project.vending_emulator run
 | `8` | `ERROR_CLEAR`: снять последнюю ошибку |
 | `9` | `UNLOAD`: −1 шт. каждого товара |
 
-Состояние в heartbeat: `ERROR` при открытой ошибке, иначе `IDLE`.
+Состояние в heartbeat — состояние `VirtualMTA` (`IDLE`, `WAIT_PAYMENT`,
+`DISPENSING`, `SUCCESS`, `ERROR`); при открытой ошибке продажа невозможна.
 Параметр `run`: `--heartbeat` (период, с). Без терминала (pipe) клавиши
 читаются из stdin, на EOF эмулятор завершается.
-
-`check` проверяет: heartbeat без ключа и с неверным ключом (401);
-принятую продажу и её повтор (`already_accepted`); дубликат `session_id`,
-`payment=FAILED`, цену 0, неизвестный товар, `created_at` без часового
-пояса, неизвестный `event_type`, `UNLOAD` сверх остатка (всё — 400);
-цикл `ERROR_SET`/`ERROR_CLEAR`; неизвестное устройство.
-
-Общие параметры (флаг или переменная окружения): `--url` / `MTA_URL`
-(по умолчанию `http://127.0.0.1:8001`), `--device-id` / `MTA_DEVICE_ID`
-(`MTA-001`), `--key` / `MTA_DEVICE_KEY` (обязателен для `run` и `check`),
-`--db` / `MTA_DB_PATH` (только для `seed`, по умолчанию `mta.db`).
-
-Особенность сервера, зафиксированная в `check`: повторный `ERROR_SET` с тем
-же кодом при открытой ошибке принимается (200) как no-op.
-
-## 7. Известные ограничения
-
-1. Файл `mta.db` закоммичен и не исключён в `.gitignore`.
-2. В `receive_event` вызов `logger.exception("Event database failure: ?", ...)`
-   использует `?` вместо `%s`.
-3. Монитор жёстко привязан к `MTA-001`; единственный пользователь — `admin`.
-4. Счётчик попыток входа хранится в памяти процесса (не работает при нескольких воркерах).
-5. `GET /api/v1/devices/{id}` для неизвестного устройства возвращает 200 со
-   `status: not_found`, а `/api/v1/monitor/{id}` — 404.
-6. Тестов, CI и миграций нет; схема восстановлена вручную по запросам сервера.

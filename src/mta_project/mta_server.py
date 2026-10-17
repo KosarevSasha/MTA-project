@@ -33,17 +33,21 @@ def require_device_key(device_id: str, supplied_key: Optional[str]) -> None:
     raw = os.getenv("MTA_DEVICE_KEYS", "")
     try:
         keys = json.loads(raw)
-    except (ValueError, TypeError):
+    except ValueError, TypeError:
         keys = None
     if not isinstance(keys, dict) or not keys:
         logger.error("Device authentication is not configured")
-        raise HTTPException(status_code=503, detail="Device authentication not configured")
+        raise HTTPException(
+            status_code=503, detail="Device authentication not configured"
+        )
     expected = keys.get(device_id)
-    if (not isinstance(expected, str) or len(expected) < 32
-            or not isinstance(supplied_key, str)
-            or not hmac.compare_digest(expected, supplied_key)):
+    if (
+        not isinstance(expected, str)
+        or len(expected) < 32
+        or not isinstance(supplied_key, str)
+        or not hmac.compare_digest(expected, supplied_key)
+    ):
         raise HTTPException(status_code=401, detail="Invalid device credentials")
-
 
 
 # --- Operator login: local testing on 127.0.0.1 only. Use HTTPS + secure cookies on VPS. ---
@@ -74,16 +78,22 @@ def _verify_password(password, stored):
         scheme, rounds, salt, expected = stored.split("$")
         if scheme != "pbkdf2_sha256" or int(rounds) < 200000:
             return False
-        computed = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), bytes.fromhex(salt), int(rounds))
+        computed = hashlib.pbkdf2_hmac(
+            "sha256", password.encode("utf-8"), bytes.fromhex(salt), int(rounds)
+        )
         return hmac.compare_digest(computed, bytes.fromhex(expected))
-    except (ValueError, TypeError):
+    except ValueError, TypeError:
         return False
 
 
 def _sign_session(signing_key):
-    payload = "admin:{}:{}".format(int(time.time()) + SESSION_LIFETIME, secrets.token_hex(16))
+    payload = "admin:{}:{}".format(
+        int(time.time()) + SESSION_LIFETIME, secrets.token_hex(16)
+    )
     body = _b64(payload.encode("utf-8"))
-    signature = _b64(hmac.new(signing_key, body.encode("ascii"), hashlib.sha256).digest())
+    signature = _b64(
+        hmac.new(signing_key, body.encode("ascii"), hashlib.sha256).digest()
+    )
     return body + "." + signature
 
 
@@ -91,12 +101,14 @@ def _has_session(request):
     try:
         _, signing_key = _operator_config()
         body, signature = request.cookies.get(COOKIE_NAME, "").split(".", 1)
-        expected = _b64(hmac.new(signing_key, body.encode("ascii"), hashlib.sha256).digest())
+        expected = _b64(
+            hmac.new(signing_key, body.encode("ascii"), hashlib.sha256).digest()
+        )
         if not hmac.compare_digest(signature, expected):
             return False
         role, expiry, nonce = _unb64(body).decode("utf-8").split(":", 2)
         return role == "admin" and len(nonce) == 32 and time.time() < int(expiry)
-    except (ValueError, UnicodeError, TypeError):
+    except ValueError, UnicodeError, TypeError:
         return False
 
 
@@ -113,7 +125,7 @@ def _same_origin(request):
     return referer.startswith(str(request.base_url))
 
 
-LOGIN_HTML = r'''<!doctype html><html lang="ru"><head><meta charset="utf-8">
+LOGIN_HTML = r"""<!doctype html><html lang="ru"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>Вход · MTA Monitor</title>
 <style>*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;background:#0c1421;color:#eef4ff;font-family:system-ui,Segoe UI,sans-serif;padding:18px}
 main{width:min(420px,100%);background:#152235;border:1px solid #30445f;border-radius:18px;padding:32px;box-shadow:0 24px 70px #050a1399}
@@ -125,14 +137,17 @@ input:focus{outline:2px solid #4b96e0}button{width:100%;margin-top:26px;padding:
 ERROR_PLACEHOLDER
 <form action="/login" method="post" autocomplete="on"><label for="username">Логин</label><input id="username" name="username" value="admin" autocomplete="username" required>
 <label for="password">Пароль</label><input id="password" name="password" type="password" autocomplete="current-password" required>
-<button type="submit">Войти в систему</button></form><footer>Доступ только для авторизованных операторов</footer></main></body></html>'''
+<button type="submit">Войти в систему</button></form><footer>Доступ только для авторизованных операторов</footer></main></body></html>"""
 
 
 @app.get("/login", response_class=HTMLResponse)
 def login_page(request: Request):
     if _has_session(request):
         return RedirectResponse("/monitor", status_code=303)
-    return HTMLResponse(LOGIN_HTML.replace("ERROR_PLACEHOLDER", ""), headers={"Cache-Control": "no-store"})
+    return HTMLResponse(
+        LOGIN_HTML.replace("ERROR_PLACEHOLDER", ""),
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @app.post("/login")
@@ -147,14 +162,29 @@ def login(request: Request, username: str = Form(...), password: str = Form(...)
         attempts.popleft()
     if len(attempts) >= 5:
         raise HTTPException(429, "Too many login attempts. Try again later")
-    valid = hmac.compare_digest(username, "admin") and _verify_password(password, digest)
+    valid = hmac.compare_digest(username, "admin") and _verify_password(
+        password, digest
+    )
     if not valid:
         attempts.append(now)
-        return HTMLResponse(LOGIN_HTML.replace("ERROR_PLACEHOLDER", '<div class="err">Неверный логин или пароль</div>'), status_code=401, headers={"Cache-Control": "no-store"})
+        return HTMLResponse(
+            LOGIN_HTML.replace(
+                "ERROR_PLACEHOLDER", '<div class="err">Неверный логин или пароль</div>'
+            ),
+            status_code=401,
+            headers={"Cache-Control": "no-store"},
+        )
     attempts.clear()
     response = RedirectResponse("/monitor", status_code=303)
-    response.set_cookie(COOKIE_NAME, _sign_session(signing_key), max_age=SESSION_LIFETIME,
-                        httponly=True, samesite="strict", secure=os.getenv("MTA_HTTPS", "0") == "1", path="/")
+    response.set_cookie(
+        COOKIE_NAME,
+        _sign_session(signing_key),
+        max_age=SESSION_LIFETIME,
+        httponly=True,
+        samesite="strict",
+        secure=os.getenv("MTA_HTTPS", "0") == "1",
+        path="/",
+    )
     response.headers["Cache-Control"] = "no-store"
     return response
 
@@ -376,10 +406,7 @@ def get_device(device_id: str, _operator=Depends(require_operator)):
 
     communication = (
         "ONLINE"
-        if (
-            seconds_since_last_seen is not None
-            and seconds_since_last_seen <= 30
-        )
+        if (seconds_since_last_seen is not None and seconds_since_last_seen <= 30)
         else "OFFLINE"
     )
 
@@ -408,7 +435,6 @@ def receive_event(event: DeviceEvent, x_mta_key: Optional[str] = Header(default=
     try:
         with get_db_connection() as conn:
             with closing(conn.cursor()) as cur:
-
                 cur.execute(
                     """
                     INSERT INTO events (
@@ -482,9 +508,7 @@ def receive_event(event: DeviceEvent, x_mta_key: Optional[str] = Header(default=
                     )
 
                     if not cur.fetchall():
-                        raise ValueError(
-                            "Product not found or inventory is empty"
-                        )
+                        raise ValueError("Product not found or inventory is empty")
 
                 elif event.event_type == "LOAD":
                     cur.execute(
@@ -503,9 +527,7 @@ def receive_event(event: DeviceEvent, x_mta_key: Optional[str] = Header(default=
                     )
 
                     if not cur.fetchall():
-                        raise ValueError(
-                            "Inventory record not found"
-                        )
+                        raise ValueError("Inventory record not found")
 
                 elif event.event_type == "UNLOAD":
                     cur.execute(
@@ -526,9 +548,7 @@ def receive_event(event: DeviceEvent, x_mta_key: Optional[str] = Header(default=
                     )
 
                     if not cur.fetchall():
-                        raise ValueError(
-                            "Product not found or insufficient inventory"
-                        )
+                        raise ValueError("Product not found or insufficient inventory")
 
                 elif event.event_type == "ERROR_SET":
                     cur.execute(
@@ -590,9 +610,7 @@ def receive_event(event: DeviceEvent, x_mta_key: Optional[str] = Header(default=
                     )
 
                     if not cur.fetchall():
-                        raise ValueError(
-                            "No active fault with this error_code"
-                        )
+                        raise ValueError("No active fault with this error_code")
 
                     cur.execute(
                         """
@@ -650,41 +668,54 @@ def receive_event(event: DeviceEvent, x_mta_key: Optional[str] = Header(default=
             detail="Database temporarily unavailable",
         )
 
+
 # --- MTA Monitor 1.0: read-only dashboard, using existing SQLite tables ---
 @app.get("/api/v1/monitor/{device_id}")
 def monitor_device(device_id: str, _operator=Depends(require_operator)):
     try:
         with get_db_connection() as conn:
             with closing(conn.cursor()) as cur:
-                cur.execute("""
+                cur.execute(
+                    """
                     SELECT device_id, name, location, machine_state,
                            active_error, last_seen
                     FROM devices WHERE device_id = ?
-                """, (device_id,))
+                """,
+                    (device_id,),
+                )
                 device = cur.fetchone()
                 if device is None:
                     raise HTTPException(status_code=404, detail="Device not found")
 
-                cur.execute("""
+                cur.execute(
+                    """
                     SELECT i.product_id, i.quantity
                     FROM inventory AS i
                     WHERE i.device_id = ?
                     ORDER BY i.product_id
-                """, (device_id,))
+                """,
+                    (device_id,),
+                )
                 inventory = [dict(row) for row in cur.fetchall()]
 
-                cur.execute("""
+                cur.execute(
+                    """
                     SELECT session_id, product_id, price, sold_at
                     FROM sales WHERE device_id = ?
                     ORDER BY sold_at DESC, session_id DESC LIMIT 10
-                """, (device_id,))
+                """,
+                    (device_id,),
+                )
                 sales = [dict(row) for row in cur.fetchall()]
 
-                cur.execute("""
+                cur.execute(
+                    """
                     SELECT error_code, occurred_at, cleared_at
                     FROM device_errors WHERE device_id = ?
                     ORDER BY occurred_at DESC, error_id DESC LIMIT 10
-                """, (device_id,))
+                """,
+                    (device_id,),
+                )
                 errors = [dict(row) for row in cur.fetchall()]
     except sqlite3.Error:
         logger.exception("Monitor database failure")
@@ -692,15 +723,17 @@ def monitor_device(device_id: str, _operator=Depends(require_operator)):
 
     device = dict(device)
     last_seen = from_db_time(device["last_seen"])
-    age = (max(0.0, (datetime.now(timezone.utc) - last_seen).total_seconds())
-           if last_seen is not None else None)
+    age = (
+        max(0.0, (datetime.now(timezone.utc) - last_seen).total_seconds())
+        if last_seen is not None
+        else None
+    )
     device["communication"] = "ONLINE" if age is not None and age <= 30 else "OFFLINE"
     device["seconds_since_last_seen"] = round(age, 1) if age is not None else None
-    return {"device": device, "inventory": inventory,
-            "sales": sales, "errors": errors}
+    return {"device": device, "inventory": inventory, "sales": sales, "errors": errors}
 
 
-MONITOR_HTML = r'''<!doctype html>
+MONITOR_HTML = r"""<!doctype html>
 <html lang="ru">
 <head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -760,7 +793,7 @@ async function refresh(){
  }catch(err){el('error').style.display='block';el('error').textContent='Нет данных от сервера: '+err.message;el('updated').textContent='Ошибка обновления';}
 }
 refresh();setInterval(refresh,10000);
-</script></body></html>'''
+</script></body></html>"""
 
 
 @app.get("/monitor", response_class=HTMLResponse)
@@ -768,3 +801,40 @@ def monitor_page(request: Request):
     if not _has_session(request):
         return RedirectResponse("/login", status_code=303)
     return HTMLResponse(content=MONITOR_HTML, headers={"Cache-Control": "no-store"})
+
+
+def load_env_file(path):
+    """Load KEY=VALUE lines into os.environ; variables already set win."""
+    try:
+        lines = open(path, encoding="utf-8").read().splitlines()
+    except FileNotFoundError:
+        return False
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        os.environ.setdefault(key.strip(), value)
+    return True
+
+
+def main():
+    """Entry point for `uv run server`; host/port from UVICORN_HOST/UVICORN_PORT."""
+    import argparse
+
+    import uvicorn
+
+    parser = argparse.ArgumentParser(description="Run the MTA server")
+    parser.add_argument("--env-file", default=".env", help="default: .env")
+    args = parser.parse_args()
+    if not load_env_file(args.env_file):
+        logger.warning("env file %s not found", args.env_file)
+
+    uvicorn.run(
+        app,
+        host=os.getenv("UVICORN_HOST", "127.0.0.1"),
+        port=int(os.getenv("UVICORN_PORT", "8001")),
+    )
