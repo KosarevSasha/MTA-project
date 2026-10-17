@@ -1,4 +1,4 @@
-"""Local-only MTA stage2 launcher with PostgreSQL password. Copy KeePassXC secrets on request; never paste into CMD.
+"""Local-only MTA stage2 launcher (SQLite3). Copy KeePassXC secrets on request; never paste into CMD.
 Do not use for internet-facing deployment. Requires: pip install python-multipart
 """
 import hashlib
@@ -41,14 +41,12 @@ def main():
         digest = hashlib.pbkdf2_hmac('sha256', admin_password.encode('utf-8'), salt, rounds)
         os.environ['MTA_ADMIN_PASSWORD_HASH'] = 'pbkdf2_sha256${}${}${}'.format(rounds, salt.hex(), digest.hex())
         del admin_password
-        db_password = request_secret('MTA PostgreSQL', 1)
-        os.environ['MTA_DB_PASSWORD'] = db_password
-        del db_password
+        os.environ.setdefault('MTA_DB_PATH', 'mta.db')  # SQLite file; create it with mta_schema.sql + mta_errors.sql
         os.environ['MTA_SESSION_SECRET'] = secrets.token_urlsafe(48)
         os.environ['MTA_HTTPS'] = '0'  # local 127.0.0.1 ONLY; use HTTPS and secure cookies on VPS
         print('\nConfiguration ready. Local server: http://127.0.0.1:8001/login')
         import uvicorn
-        uvicorn.run('mta_server_v1_5_stage2:app', host='127.0.0.1', port=8001)
+        uvicorn.run('mta_project.mta_server:app', host='127.0.0.1', port=8001)
     except (EOFError, KeyboardInterrupt):
         print('\nCancelled.')
         return 1

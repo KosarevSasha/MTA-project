@@ -1,16 +1,22 @@
--- MTA server v1.3: run ONCE in pgAdmin Query Tool against mta_db.
+-- MTA server v1.3 (SQLite3): run ONCE against the MTA database, e.g.
+--   sqlite3 test.db < mta_errors.sql
 -- Existing devices/events/sales/inventory data are not modified.
+-- Foreign keys are enforced only when enabled on each connection.
+PRAGMA foreign_keys = ON;
+
 BEGIN;
 
 CREATE TABLE IF NOT EXISTS device_errors (
-    error_id BIGSERIAL PRIMARY KEY,
-    device_id VARCHAR(50) NOT NULL REFERENCES devices(device_id),
-    error_code VARCHAR(100) NOT NULL,
-    occurred_at TIMESTAMPTZ NOT NULL,
-    cleared_at TIMESTAMPTZ,
-    set_event_id VARCHAR(100) NOT NULL UNIQUE REFERENCES events(event_id),
-    clear_event_id VARCHAR(100) UNIQUE REFERENCES events(event_id),
-    details JSONB NOT NULL DEFAULT '{}'::jsonb,
+    error_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_id TEXT NOT NULL REFERENCES devices(device_id),
+    error_code TEXT NOT NULL,
+    -- Timestamps are stored as ISO 8601 UTC text, e.g. '2026-10-17T12:34:56Z'.
+    -- Always use the same format so text comparison matches time order.
+    occurred_at TEXT NOT NULL,
+    cleared_at TEXT,
+    set_event_id TEXT NOT NULL UNIQUE REFERENCES events(event_id),
+    clear_event_id TEXT UNIQUE REFERENCES events(event_id),
+    details TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(details)),
     CONSTRAINT device_errors_times_valid CHECK (
         cleared_at IS NULL OR cleared_at >= occurred_at
     ),

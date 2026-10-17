@@ -1,4 +1,4 @@
-"""MTA server v1.5 (stage 2): device and operator authentication (Python 3.8)."""
+"""MTA server v1.5 (stage 2): device and operator authentication (SQLite3)."""
 
 import hmac
 import hashlib
@@ -10,11 +10,11 @@ from urllib.parse import quote
 import json
 import logging
 import os
+import sqlite3
+from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 from typing import Optional
 
-import psycopg2
-import psycopg2.extras
 from fastapi import FastAPI, Header, HTTPException, Request, Depends, Form
 from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel, Field
@@ -184,15 +184,36 @@ class DeviceEvent(BaseModel):
     data: dict = Field(default_factory=dict)
 
 
+def get_db_path():
+    return os.getenv("MTA_DB_PATH", "mta.db")
+
+
+@contextmanager
 def get_db_connection():
-    return psycopg2.connect(
-        host="localhost",
-        port=5432,
-        dbname="mta_db",
-        user="postgres",
-        password=os.getenv("MTA_DB_PASSWORD"),
-        connect_timeout=5,
-    )
+    """Open a connection; commit on success, roll back on error, always close."""
+    conn = sqlite3.connect(get_db_path(), timeout=5)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA journal_mode = WAL")
+    try:
+        with conn:
+            yield conn
+    finally:
+        conn.close()
+
+
+def to_db_time(value):
+    """Fixed-width UTC ISO 8601 text, so string order equals time order."""
+    return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def from_db_time(value):
+    if value is None:
+        return None
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
 
 
 def require_text(value, field):
@@ -265,33 +286,34 @@ def heartbeat(data: Heartbeat, x_mta_key: Optional[str] = Header(default=None)):
 
     try:
         with get_db_connection() as conn:
-            with conn.cursor() as cur:
+            with closing(conn.cursor()) as cur:
                 cur.execute(
                     """
                     UPDATE devices
-                    SET machine_state = %s,
+                    SET machine_state = ?,
                         active_error = COALESCE(
                             (
                                 SELECT error_code
                                 FROM device_errors
-                                WHERE device_id = %s
+                                WHERE device_id = ?
                                   AND cleared_at IS NULL
                                 ORDER BY occurred_at DESC, error_id DESC
                                 LIMIT 1
                             ),
                             CASE
-                                WHEN %s = 'ERROR' THEN %s
+                                WHEN ? = 'ERROR' THEN ?
                                 ELSE 'NONE'
                             END
                         ),
-                        last_seen = NOW()
-                    WHERE device_id = %s
+                        last_seen = ?
+                    WHERE device_id = ?
                     """,
                     (
                         data.state,
                         data.device_id,
                         data.state,
                         data.active_error,
+                        to_db_time(datetime.now(timezone.utc)),
                         data.device_id,
                     ),
                 )
@@ -302,7 +324,7 @@ def heartbeat(data: Heartbeat, x_mta_key: Optional[str] = Header(default=None)):
                         detail="Device not found",
                     )
 
-    except psycopg2.Error:
+    except sqlite3.Error:
         logger.exception("Heartbeat database failure")
         raise HTTPException(
             status_code=503,
@@ -316,19 +338,19 @@ def heartbeat(data: Heartbeat, x_mta_key: Optional[str] = Header(default=None)):
 def get_device(device_id: str, _operator=Depends(require_operator)):
     try:
         with get_db_connection() as conn:
-            with conn.cursor() as cur:
+            with closing(conn.cursor()) as cur:
                 cur.execute(
                     """
                     SELECT device_id, machine_state, active_error, last_seen
                     FROM devices
-                    WHERE device_id = %s
+                    WHERE device_id = ?
                     """,
                     (device_id,),
                 )
 
                 row = cur.fetchone()
 
-    except psycopg2.Error:
+    except sqlite3.Error:
         logger.exception("Device lookup database failure")
         raise HTTPException(
             status_code=503,
@@ -341,7 +363,8 @@ def get_device(device_id: str, _operator=Depends(require_operator)):
             "device_id": device_id,
         }
 
-    found_id, machine_state, active_error, last_seen = row
+    found_id, machine_state, active_error, last_seen = tuple(row)
+    last_seen = from_db_time(last_seen)
 
     seconds_since_last_seen = None
 
@@ -384,7 +407,7 @@ def receive_event(event: DeviceEvent, x_mta_key: Optional[str] = Header(default=
 
     try:
         with get_db_connection() as conn:
-            with conn.cursor() as cur:
+            with closing(conn.cursor()) as cur:
 
                 cur.execute(
                     """
@@ -396,7 +419,7 @@ def receive_event(event: DeviceEvent, x_mta_key: Optional[str] = Header(default=
                         created_at,
                         data
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s)
+                    VALUES (?, ?, ?, ?, ?, ?)
                     ON CONFLICT (event_id) DO NOTHING
                     RETURNING event_id
                     """,
@@ -405,12 +428,12 @@ def receive_event(event: DeviceEvent, x_mta_key: Optional[str] = Header(default=
                         event.device_id,
                         event.event_type,
                         event.session_id,
-                        event.created_at,
-                        psycopg2.extras.Json(event.data),
+                        to_db_time(event.created_at),
+                        json.dumps(event.data),
                     ),
                 )
 
-                if cur.fetchone() is None:
+                if not cur.fetchall():
                     return {
                         "status": "already_accepted",
                         "event_id": event.event_id,
@@ -429,7 +452,7 @@ def receive_event(event: DeviceEvent, x_mta_key: Optional[str] = Header(default=
                             sold_at,
                             event_id
                         )
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             event.session_id,
@@ -438,7 +461,7 @@ def receive_event(event: DeviceEvent, x_mta_key: Optional[str] = Header(default=
                             event.data["price"],
                             event.data["payment"],
                             event.data["dispense"],
-                            event.created_at,
+                            to_db_time(event.created_at),
                             event.event_id,
                         ),
                     )
@@ -447,8 +470,8 @@ def receive_event(event: DeviceEvent, x_mta_key: Optional[str] = Header(default=
                         """
                         UPDATE inventory
                         SET quantity = quantity - 1
-                        WHERE device_id = %s
-                          AND product_id = %s
+                        WHERE device_id = ?
+                          AND product_id = ?
                           AND quantity > 0
                         RETURNING quantity
                         """,
@@ -458,7 +481,7 @@ def receive_event(event: DeviceEvent, x_mta_key: Optional[str] = Header(default=
                         ),
                     )
 
-                    if cur.fetchone() is None:
+                    if not cur.fetchall():
                         raise ValueError(
                             "Product not found or inventory is empty"
                         )
@@ -467,9 +490,9 @@ def receive_event(event: DeviceEvent, x_mta_key: Optional[str] = Header(default=
                     cur.execute(
                         """
                         UPDATE inventory
-                        SET quantity = quantity + %s
-                        WHERE device_id = %s
-                          AND product_id = %s
+                        SET quantity = quantity + ?
+                        WHERE device_id = ?
+                          AND product_id = ?
                         RETURNING quantity
                         """,
                         (
@@ -479,7 +502,7 @@ def receive_event(event: DeviceEvent, x_mta_key: Optional[str] = Header(default=
                         ),
                     )
 
-                    if cur.fetchone() is None:
+                    if not cur.fetchall():
                         raise ValueError(
                             "Inventory record not found"
                         )
@@ -488,10 +511,10 @@ def receive_event(event: DeviceEvent, x_mta_key: Optional[str] = Header(default=
                     cur.execute(
                         """
                         UPDATE inventory
-                        SET quantity = quantity - %s
-                        WHERE device_id = %s
-                          AND product_id = %s
-                          AND quantity >= %s
+                        SET quantity = quantity - ?
+                        WHERE device_id = ?
+                          AND product_id = ?
+                          AND quantity >= ?
                         RETURNING quantity
                         """,
                         (
@@ -502,7 +525,7 @@ def receive_event(event: DeviceEvent, x_mta_key: Optional[str] = Header(default=
                         ),
                     )
 
-                    if cur.fetchone() is None:
+                    if not cur.fetchall():
                         raise ValueError(
                             "Product not found or insufficient inventory"
                         )
@@ -517,7 +540,7 @@ def receive_event(event: DeviceEvent, x_mta_key: Optional[str] = Header(default=
                             set_event_id,
                             details
                         )
-                        VALUES (%s, %s, %s, %s, %s)
+                        VALUES (?, ?, ?, ?, ?)
                         ON CONFLICT (device_id, error_code)
                             WHERE cleared_at IS NULL
                         DO NOTHING
@@ -525,17 +548,17 @@ def receive_event(event: DeviceEvent, x_mta_key: Optional[str] = Header(default=
                         (
                             event.device_id,
                             event.data["error_code"],
-                            event.created_at,
+                            to_db_time(event.created_at),
                             event.event_id,
-                            psycopg2.extras.Json(event.data),
+                            json.dumps(event.data),
                         ),
                     )
 
                     cur.execute(
                         """
                         UPDATE devices
-                        SET active_error = %s
-                        WHERE device_id = %s
+                        SET active_error = ?
+                        WHERE device_id = ?
                         """,
                         (
                             event.data["error_code"],
@@ -547,27 +570,26 @@ def receive_event(event: DeviceEvent, x_mta_key: Optional[str] = Header(default=
                     cur.execute(
                         """
                         UPDATE device_errors
-                        SET cleared_at = %s,
-                            clear_event_id = %s
+                        SET cleared_at = ?,
+                            clear_event_id = ?
                         WHERE error_id = (
                             SELECT error_id
                             FROM device_errors
-                            WHERE device_id = %s
-                              AND error_code = %s
+                            WHERE device_id = ?
+                              AND error_code = ?
                               AND cleared_at IS NULL
-                            FOR UPDATE
                         )
                         RETURNING error_id
                         """,
                         (
-                            event.created_at,
+                            to_db_time(event.created_at),
                             event.event_id,
                             event.device_id,
                             event.data["error_code"],
                         ),
                     )
 
-                    if cur.fetchone() is None:
+                    if not cur.fetchall():
                         raise ValueError(
                             "No active fault with this error_code"
                         )
@@ -579,14 +601,14 @@ def receive_event(event: DeviceEvent, x_mta_key: Optional[str] = Header(default=
                             (
                                 SELECT error_code
                                 FROM device_errors
-                                WHERE device_id = %s
+                                WHERE device_id = ?
                                   AND cleared_at IS NULL
                                 ORDER BY occurred_at DESC, error_id DESC
                                 LIMIT 1
                             ),
                             'NONE'
                         )
-                        WHERE device_id = %s
+                        WHERE device_id = ?
                         """,
                         (
                             event.device_id,
@@ -602,27 +624,25 @@ def receive_event(event: DeviceEvent, x_mta_key: Optional[str] = Header(default=
     except ValueError as error:
         raise bad_request(event.event_id, str(error))
 
-    except psycopg2.errors.ForeignKeyViolation:
-        raise bad_request(
-            event.event_id,
-            "Unknown device or product",
-        )
+    except sqlite3.IntegrityError as error:
+        code = getattr(error, "sqlite_errorname", "")
+        if code == "SQLITE_CONSTRAINT_FOREIGNKEY":
+            reason = "Unknown device or product"
+        elif code in ("SQLITE_CONSTRAINT_UNIQUE", "SQLITE_CONSTRAINT_PRIMARYKEY"):
+            reason = "Conflicting sale or session_id"
+        elif code == "SQLITE_CONSTRAINT_CHECK":
+            reason = "Invalid fault timestamps or constraints"
+        else:
+            logger.exception("Event integrity failure: %s", event.event_id)
+            raise HTTPException(
+                status_code=503,
+                detail="Database temporarily unavailable",
+            )
+        raise bad_request(event.event_id, reason)
 
-    except psycopg2.errors.UniqueViolation:
-        raise bad_request(
-            event.event_id,
-            "Conflicting sale or session_id",
-        )
-
-    except psycopg2.errors.CheckViolation:
-        raise bad_request(
-            event.event_id,
-            "Invalid fault timestamps or constraints",
-        )
-
-    except psycopg2.Error:
+    except sqlite3.Error:
         logger.exception(
-            "Event database failure: %s",
+            "Event database failure: ?",
             event.event_id,
         )
         raise HTTPException(
@@ -630,16 +650,16 @@ def receive_event(event: DeviceEvent, x_mta_key: Optional[str] = Header(default=
             detail="Database temporarily unavailable",
         )
 
-# --- MTA Monitor 1.0: read-only dashboard, using existing PostgreSQL tables ---
+# --- MTA Monitor 1.0: read-only dashboard, using existing SQLite tables ---
 @app.get("/api/v1/monitor/{device_id}")
 def monitor_device(device_id: str, _operator=Depends(require_operator)):
     try:
         with get_db_connection() as conn:
-            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            with closing(conn.cursor()) as cur:
                 cur.execute("""
                     SELECT device_id, name, location, machine_state,
                            active_error, last_seen
-                    FROM devices WHERE device_id = %s
+                    FROM devices WHERE device_id = ?
                 """, (device_id,))
                 device = cur.fetchone()
                 if device is None:
@@ -648,30 +668,30 @@ def monitor_device(device_id: str, _operator=Depends(require_operator)):
                 cur.execute("""
                     SELECT i.product_id, i.quantity
                     FROM inventory AS i
-                    WHERE i.device_id = %s
+                    WHERE i.device_id = ?
                     ORDER BY i.product_id
                 """, (device_id,))
                 inventory = [dict(row) for row in cur.fetchall()]
 
                 cur.execute("""
                     SELECT session_id, product_id, price, sold_at
-                    FROM sales WHERE device_id = %s
+                    FROM sales WHERE device_id = ?
                     ORDER BY sold_at DESC, session_id DESC LIMIT 10
                 """, (device_id,))
                 sales = [dict(row) for row in cur.fetchall()]
 
                 cur.execute("""
                     SELECT error_code, occurred_at, cleared_at
-                    FROM device_errors WHERE device_id = %s
+                    FROM device_errors WHERE device_id = ?
                     ORDER BY occurred_at DESC, error_id DESC LIMIT 10
                 """, (device_id,))
                 errors = [dict(row) for row in cur.fetchall()]
-    except psycopg2.Error:
+    except sqlite3.Error:
         logger.exception("Monitor database failure")
         raise HTTPException(status_code=503, detail="Database temporarily unavailable")
 
     device = dict(device)
-    last_seen = device["last_seen"]
+    last_seen = from_db_time(device["last_seen"])
     age = (max(0.0, (datetime.now(timezone.utc) - last_seen).total_seconds())
            if last_seen is not None else None)
     device["communication"] = "ONLINE" if age is not None and age <= 30 else "OFFLINE"
