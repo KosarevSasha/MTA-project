@@ -1,30 +1,36 @@
 """MTA server v1.5 (stage 2): device and operator authentication (SQLite3)."""
 
-import hmac
-import hashlib
 import base64
-import secrets
-import time
-from collections import defaultdict, deque
-from urllib.parse import quote
+import hashlib
+import hmac
 import json
 import logging
 import os
+import secrets
 import sqlite3
+import time
+from collections import defaultdict, deque
 from contextlib import closing, contextmanager
 from datetime import datetime, timezone
-from typing import Optional
+from pathlib import Path
 
-from fastapi import FastAPI, Header, HTTPException, Request, Depends, Form
+from fastapi import Depends, FastAPI, Form, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 
+BASE_DIR = Path(__file__).resolve().parent
+STATIC_DIR = BASE_DIR / "static"
 
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
-logger = logging.getLogger("mta_server")
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+logger = logging.getLogger(__name__)
+templates = Jinja2Templates(directory=STATIC_DIR / "templates")
 
 
-def require_device_key(device_id: str, supplied_key: Optional[str]) -> None:
+def require_device_key(device_id: str, supplied_key: str | None) -> None:
     """Authenticate device requests against per-device keys in MTA_DEVICE_KEYS.
 
     Environment example: MTA_DEVICE_KEYS={"MTA-001":"long-random-secret"}
@@ -125,29 +131,13 @@ def _same_origin(request):
     return referer.startswith(str(request.base_url))
 
 
-LOGIN_HTML = r"""<!doctype html><html lang="ru"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>Вход · MTA Monitor</title>
-<style>*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;background:#0c1421;color:#eef4ff;font-family:system-ui,Segoe UI,sans-serif;padding:18px}
-main{width:min(420px,100%);background:#152235;border:1px solid #30445f;border-radius:18px;padding:32px;box-shadow:0 24px 70px #050a1399}
-h1{text-align:center;font-size:28px;margin:0 0 8px}.sub{text-align:center;color:#a7b8cd;margin:0 0 30px;font-size:14px}
-label{display:block;margin:16px 0 7px;color:#b7cbe0;font-size:14px}input{width:100%;padding:14px;border:1px solid #435773;border-radius:10px;background:#0e1a2b;color:white;font-size:16px}
-input:focus{outline:2px solid #4b96e0}button{width:100%;margin-top:26px;padding:14px;border:0;border-radius:10px;background:#3275b8;color:white;font-weight:700;font-size:16px;cursor:pointer}
-.err{padding:12px;border-radius:9px;background:#542b35;color:#ffd2da;margin:12px 0}footer{text-align:center;color:#8198b2;font-size:12px;margin-top:25px}</style></head>
-<body><main><h1>◉ MTA Monitor</h1><p class="sub">Панель управления торговыми автоматами</p>
-ERROR_PLACEHOLDER
-<form action="/login" method="post" autocomplete="on"><label for="username">Логин</label><input id="username" name="username" value="admin" autocomplete="username" required>
-<label for="password">Пароль</label><input id="password" name="password" type="password" autocomplete="current-password" required>
-<button type="submit">Войти в систему</button></form><footer>Доступ только для авторизованных операторов</footer></main></body></html>"""
-
-
 @app.get("/login", response_class=HTMLResponse)
 def login_page(request: Request):
     if _has_session(request):
         return RedirectResponse("/monitor", status_code=303)
-    return HTMLResponse(
-        LOGIN_HTML.replace("ERROR_PLACEHOLDER", ""),
-        headers={"Cache-Control": "no-store"},
-    )
+    return templates.TemplateResponse(request=request, name="login.html", context={
+        "error_placeholder": "",
+    })
 
 
 @app.post("/login")
@@ -167,12 +157,14 @@ def login(request: Request, username: str = Form(...), password: str = Form(...)
     )
     if not valid:
         attempts.append(now)
-        return HTMLResponse(
-            LOGIN_HTML.replace(
-                "ERROR_PLACEHOLDER", '<div class="err">Неверный логин или пароль</div>'
-            ),
-            status_code=401,
-            headers={"Cache-Control": "no-store"},
+        return templates.TemplateResponse(
+            request=request, 
+            name="login.html", 
+            status_code=401, 
+            headers={"Cache-Control": "no-store"}, 
+            context={
+                "error_placeholder": '<div class="err">Неверный логин или пароль</div>',
+            }
         )
     attempts.clear()
     response = RedirectResponse("/monitor", status_code=303)
@@ -209,7 +201,7 @@ class DeviceEvent(BaseModel):
     event_id: str
     device_id: str
     event_type: str
-    session_id: Optional[str] = None
+    session_id: str | None = None
     created_at: datetime
     data: dict = Field(default_factory=dict)
 
@@ -248,13 +240,13 @@ def from_db_time(value):
 
 def require_text(value, field):
     if not isinstance(value, str) or not value.strip():
-        raise ValueError("{} must be a non-empty string".format(field))
+        raise ValueError(f"{field} must be a non-empty string")
     return value
 
 
 def require_positive_int(value, field):
     if type(value) is not int or value <= 0:
-        raise ValueError("{} must be a positive integer".format(field))
+        raise ValueError("{field} must be a positive integer")
     return value
 
 
@@ -305,7 +297,7 @@ def bad_request(event_id, reason):
 
 
 @app.post("/api/v1/device/heartbeat")
-def heartbeat(data: Heartbeat, x_mta_key: Optional[str] = Header(default=None)):
+def heartbeat(data: Heartbeat, x_mta_key: str | None = Header(default=None)):
     require_device_key(data.device_id, x_mta_key)
     try:
         require_text(data.device_id, "device_id")
@@ -315,10 +307,9 @@ def heartbeat(data: Heartbeat, x_mta_key: Optional[str] = Header(default=None)):
         raise HTTPException(status_code=400, detail=str(error))
 
     try:
-        with get_db_connection() as conn:
-            with closing(conn.cursor()) as cur:
-                cur.execute(
-                    """
+        with get_db_connection() as conn, closing(conn.cursor()) as cur:
+            cur.execute(
+                """
                     UPDATE devices
                     SET machine_state = ?,
                         active_error = COALESCE(
@@ -338,21 +329,21 @@ def heartbeat(data: Heartbeat, x_mta_key: Optional[str] = Header(default=None)):
                         last_seen = ?
                     WHERE device_id = ?
                     """,
-                    (
-                        data.state,
-                        data.device_id,
-                        data.state,
-                        data.active_error,
-                        to_db_time(datetime.now(timezone.utc)),
-                        data.device_id,
-                    ),
-                )
+                (
+                    data.state,
+                    data.device_id,
+                    data.state,
+                    data.active_error,
+                    to_db_time(datetime.now(timezone.utc)),
+                    data.device_id,
+                ),
+            )
 
-                if cur.rowcount == 0:
-                    raise HTTPException(
-                        status_code=404,
-                        detail="Device not found",
-                    )
+            if cur.rowcount == 0:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Device not found",
+                )
 
     except sqlite3.Error:
         logger.exception("Heartbeat database failure")
@@ -367,18 +358,17 @@ def heartbeat(data: Heartbeat, x_mta_key: Optional[str] = Header(default=None)):
 @app.get("/api/v1/devices/{device_id}")
 def get_device(device_id: str, _operator=Depends(require_operator)):
     try:
-        with get_db_connection() as conn:
-            with closing(conn.cursor()) as cur:
-                cur.execute(
-                    """
+        with get_db_connection() as conn, closing(conn.cursor()) as cur:
+            cur.execute(
+                """
                     SELECT device_id, machine_state, active_error, last_seen
                     FROM devices
                     WHERE device_id = ?
                     """,
-                    (device_id,),
-                )
+                (device_id,),
+            )
 
-                row = cur.fetchone()
+            row = cur.fetchone()
 
     except sqlite3.Error:
         logger.exception("Device lookup database failure")
@@ -425,7 +415,7 @@ def get_device(device_id: str, _operator=Depends(require_operator)):
 
 
 @app.post("/api/v1/device/events")
-def receive_event(event: DeviceEvent, x_mta_key: Optional[str] = Header(default=None)):
+def receive_event(event: DeviceEvent, x_mta_key: str | None = Header(default=None)):
     require_device_key(event.device_id, x_mta_key)
     try:
         validate_event(event)
@@ -733,74 +723,13 @@ def monitor_device(device_id: str, _operator=Depends(require_operator)):
     return {"device": device, "inventory": inventory, "sales": sales, "errors": errors}
 
 
-MONITOR_HTML = r"""<!doctype html>
-<html lang="ru">
-<head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>MTA Monitor 1.0</title>
-<style>
-:root{color-scheme:dark;font-family:system-ui,-apple-system,"Segoe UI",sans-serif;background:#0c1421;color:#eef4ff}
-*{box-sizing:border-box}body{margin:0;padding:24px}main{max-width:1120px;margin:auto}
-header{display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap;margin-bottom:22px}
-h1{margin:0;font-size:27px;letter-spacing:.3px}.sub{color:#9eb0c8;font-size:14px;margin-top:5px}
-#updated{color:#9eb0c8;font-size:13px}.grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}
-.card{background:#152235;border:1px solid #2b3b52;border-radius:14px;padding:20px;min-width:0}
-.card .label{color:#9eb0c8;font-size:13px;margin-bottom:12px}.big{font-size:28px;font-weight:750;overflow-wrap:anywhere}
-.ok{color:#65dbac}.bad{color:#ff8b8b}.warn{color:#f6ca79}.muted{color:#9eb0c8}
-section{margin-top:22px}h2{font-size:18px;margin:0 0 12px}.tablewrap{overflow:auto;border:1px solid #2b3b52;border-radius:12px}
-table{border-collapse:collapse;width:100%;background:#152235;font-size:14px}th,td{padding:13px 16px;text-align:left;border-bottom:1px solid #2b3b52;white-space:nowrap}th{color:#a6bad2;font-weight:600}tr:last-child td{border-bottom:0}
-.empty{color:#9eb0c8}#error{display:none;margin:14px 0;padding:12px;border-radius:10px;background:#4c242a;color:#ffd4d4}
-footer{color:#8297b2;font-size:12px;margin-top:24px}code{font-size:12px;color:#b3d4ff}
-@media(max-width:720px){body{padding:14px}.grid{grid-template-columns:1fr}h1{font-size:23px}}
-</style>
-</head><body><main>
-<header><div><h1>◉ MTA Monitor <span class="muted">1.0</span></h1><div class="sub" id="deviceTitle">MTA-001 · Мониторинг автомата</div></div><div id="updated">Подключение...</div></header>
-<div id="error" role="alert"></div>
-<div class="grid">
-<div class="card"><div class="label">Связь</div><div class="big" id="communication">—</div><div class="sub" id="lastSeen">—</div></div>
-<div class="card"><div class="label">Состояние МТА</div><div class="big" id="state">—</div><div class="sub" id="activeError">—</div></div>
-<div class="card"><div class="label">Остаток товара</div><div class="big" id="stock">—</div><div class="sub" id="stockDetails">—</div></div>
-</div>
-<section><h2>Последние продажи</h2><div class="tablewrap"><table><thead><tr><th>Время</th><th>Товар</th><th>Цена</th><th>Сессия</th></tr></thead><tbody id="sales"><tr><td colspan="4" class="empty">Загрузка...</td></tr></tbody></table></div></section>
-<section><h2>История ошибок</h2><div class="tablewrap"><table><thead><tr><th>Возникла</th><th>Ошибка</th><th>Устранена</th><th>Статус</th></tr></thead><tbody id="errors"><tr><td colspan="4" class="empty">Загрузка...</td></tr></tbody></table></div></section>
-<form action="/logout" method="post" style="text-align:right;margin-top:18px"><button type="submit" style="background:#263b54;border:1px solid #49617c;color:#eef4ff;border-radius:9px;padding:10px 20px;cursor:pointer">Выйти</button></form>
-<footer>Только просмотр · Обновление каждые 10 секунд · Время отображается в часовом поясе браузера</footer>
-</main><script>
-'use strict';
-const id = 'MTA-001';
-const el = name => document.getElementById(name);
-const date = v => v ? new Date(v).toLocaleString('ru-RU') : '—';
-function cell(row, value, cls){const td=document.createElement('td');td.textContent=String(value ?? '—');if(cls)td.className=cls;row.appendChild(td)}
-function table(name, items, cols, build){const body=el(name);body.replaceChildren();if(!items.length){const tr=document.createElement('tr');const td=document.createElement('td');td.colSpan=cols;td.className='empty';td.textContent='Записей пока нет';tr.appendChild(td);body.appendChild(tr);return}for(const item of items){const tr=document.createElement('tr');build(tr,item);body.appendChild(tr)}}
-async function refresh(){
- try{
-  const response=await fetch('/api/v1/monitor/'+encodeURIComponent(id),{cache:'no-store'});
-  if(!response.ok)throw new Error('HTTP '+response.status);
-  const result=await response.json(),d=result.device;
-  el('error').style.display='none';
-  el('deviceTitle').textContent=[d.device_id,d.name,d.location].filter(Boolean).join(' · ');
-  el('communication').textContent=d.communication;
-  el('communication').className='big '+(d.communication==='ONLINE'?'ok':'bad');
-  el('lastSeen').textContent='Последняя связь: '+date(d.last_seen);
-  el('state').textContent=d.machine_state;
-  el('state').className='big '+(d.machine_state==='ERROR'?'bad':d.machine_state==='IDLE'?'ok':'warn');
-  el('activeError').textContent='Ошибка: '+d.active_error;
-  el('stock').textContent=result.inventory.reduce((sum,item)=>sum+Number(item.quantity),0)+' шт.';
-  el('stockDetails').textContent=result.inventory.map(i=>i.product_id+': '+i.quantity).join(' · ')||'Нет данных об остатках';
-  table('sales',result.sales,4,(tr,s)=>{cell(tr,date(s.sold_at));cell(tr,s.product_id);cell(tr,s.price);cell(tr,s.session_id)});
-  table('errors',result.errors,4,(tr,e)=>{cell(tr,date(e.occurred_at));cell(tr,e.error_code);cell(tr,date(e.cleared_at));cell(tr,e.cleared_at?'Закрыта':'АКТИВНА',e.cleared_at?'ok':'bad')});
-  el('updated').textContent='Обновлено: '+new Date().toLocaleTimeString('ru-RU');
- }catch(err){el('error').style.display='block';el('error').textContent='Нет данных от сервера: '+err.message;el('updated').textContent='Ошибка обновления';}
-}
-refresh();setInterval(refresh,10000);
-</script></body></html>"""
-
-
 @app.get("/monitor", response_class=HTMLResponse)
 def monitor_page(request: Request):
     if not _has_session(request):
         return RedirectResponse("/login", status_code=303)
-    return HTMLResponse(content=MONITOR_HTML, headers={"Cache-Control": "no-store"})
+    return templates.TemplateResponse(
+        request=request, name="monitor.html", headers={"Cache-Control": "no-store"}
+    )
 
 
 def load_env_file(path):
@@ -838,3 +767,4 @@ def main():
         host=os.getenv("UVICORN_HOST", "127.0.0.1"),
         port=int(os.getenv("UVICORN_PORT", "8001")),
     )
+
