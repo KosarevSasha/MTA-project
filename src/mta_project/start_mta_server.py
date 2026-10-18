@@ -44,9 +44,9 @@ def main():
         os.environ.setdefault('MTA_DB_PATH', 'mta.db')  # SQLite file; create it with mta_schema.sql + mta_errors.sql
         os.environ['MTA_SESSION_SECRET'] = secrets.token_urlsafe(48)
         os.environ['MTA_HTTPS'] = '0'  # local 127.0.0.1 ONLY; use HTTPS and secure cookies on VPS
-        print('\nConfiguration ready. Local server: http://127.0.0.1:8001/login')
+        print('\nConfiguration ready. Local server: http://127.0.0.1:8000/login')
         import uvicorn
-        uvicorn.run('mta_project.mta_server:app', host='127.0.0.1', port=8001)
+        uvicorn.run('mta_project.mta_server:app', host='127.0.0.1', port=8000)
     except (EOFError, KeyboardInterrupt):
         print('\nCancelled.')
         return 1
