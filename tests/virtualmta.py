@@ -22,6 +22,7 @@
 """
 
 import argparse
+import contextlib
 import enum
 import json
 import os
@@ -352,44 +353,75 @@ def handle_key(machine, key, last_sale):
     return last_sale
 
 
-def cmd_run(args):
+@contextlib.contextmanager
+def key_reader():
+    """Дать функцию read_key(timeout): символ, None по таймауту или "" на EOF.
+
+    Клавиши читаются без Enter: msvcrt на Windows, termios/select на POSIX.
+    """
+    if sys.platform == "win32":
+        import msvcrt
+
+        def read_key(timeout):
+            deadline = time.monotonic() + timeout
+            while not msvcrt.kbhit():
+                if time.monotonic() >= deadline:
+                    return None
+                time.sleep(0.05)
+            return msvcrt.getwch()
+
+        yield read_key
+        return
+
     import select
     import termios
     import tty
 
-    machine = make_machine(args)
     interactive = sys.stdin.isatty()
     saved = termios.tcgetattr(sys.stdin) if interactive else None
+
+    def read_key(timeout):
+        if not select.select([sys.stdin], [], [], timeout)[0]:
+            return None
+        return os.read(sys.stdin.fileno(), 1).decode(errors="ignore")
+
+    try:
+        if interactive:
+            tty.setcbreak(sys.stdin.fileno())
+        yield read_key
+    finally:
+        if interactive:
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, saved)
+
+
+def cmd_run(args):
+    machine = make_machine(args)
     last_sale = None
     next_heartbeat = 0.0
     print(HELP)
     try:
-        if interactive:
-            tty.setcbreak(sys.stdin.fileno())
-        while True:
-            if time.monotonic() >= next_heartbeat:
-                status, answer = machine.heartbeat()
-                log(
-                    "heartbeat    -> {} {} state={}".format(
-                        status, answer, machine.state
+        with key_reader() as read_key:
+            while True:
+                if time.monotonic() >= next_heartbeat:
+                    status, answer = machine.heartbeat()
+                    log(
+                        "heartbeat    -> {} {} state={}".format(
+                            status, answer, machine.state
+                        )
                     )
-                )
-                next_heartbeat = time.monotonic() + args.heartbeat
-            wait = max(0.0, next_heartbeat - time.monotonic())
-            if not select.select([sys.stdin], [], [], wait)[0]:
-                continue
-            key = os.read(sys.stdin.fileno(), 1).decode(errors="ignore")
-            if key in ("q", "\x03", ""):  # q, Ctrl+C, EOF
-                break
-            if key == "h":
-                print(HELP)
-            else:
-                last_sale = handle_key(machine, key, last_sale) or last_sale
+                    next_heartbeat = time.monotonic() + args.heartbeat
+                wait = max(0.0, next_heartbeat - time.monotonic())
+                key = read_key(wait)
+                if key is None:
+                    continue
+                if key in ("q", "\x03", ""):  # q, Ctrl+C, EOF
+                    break
+                if key == "h":
+                    print(HELP)
+                else:
+                    last_sale = handle_key(machine, key, last_sale) or last_sale
     except KeyboardInterrupt:
         pass
-    finally:
-        if interactive:
-            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, saved)
     log("stopped")
 
 
