@@ -131,9 +131,51 @@ class TestSale:
         before = event_count(db, stocked)
         stocked.start_sale("COLA")
         stocked.pay()
-        assert stocked.dispense(success=False) is None
+        body, status, _a = stocked.dispense(success=False)
+        assert status == 200
+        assert (body["event_type"], body["data"]) == (
+            "ERROR_SET", {"error_code": "DISPENSE_FAILURE"})
         assert stocked.state == MTAState.ERROR
+        assert event_count(db, stocked) == before + 1
+        assert stock_of(db, stocked, "COLA") == 5
+
+    def test_service_door_clears_firmware_fault(self, stocked):
+        stocked.start_sale("COLA")
+        stocked.pay()
+        stocked.dispense(success=False)
+        body, status, _a = stocked.open_service_door()
+        assert (status, body["event_type"]) == (200, "ERROR_CLEAR")
+        assert stocked.state == MTAState.SERVICE
+        assert stocked.active_errors == []
+        stocked.close_service_door()
+        assert stocked.state == MTAState.IDLE
+
+    def test_service_dispense_sends_no_sale(self, stocked, db):
+        before = event_count(db, stocked)
+        stocked.open_service_door()
+        assert stocked.service_dispense()
+        assert stocked.state == MTAState.SERVICE
         assert event_count(db, stocked) == before
+
+    def test_empty_and_tray_states(self, stocked):
+        stocked.set_next_can(False)
+        stocked.set_tray(False)
+        stocked.open_service_door()
+        stocked.close_service_door()
+        assert stocked.state == MTAState.EMPTY
+        stocked.set_next_can(True)
+        assert stocked.state == MTAState.IDLE
+        stocked.set_tray(True)
+        assert stocked.state == MTAState.WAIT_CLEAR_DISPENSER
+        stocked.set_tray(False)
+        assert stocked.state == MTAState.IDLE
+
+    def test_shutter_timeout_is_error(self, stocked):
+        stocked.shutter_raised()
+        assert stocked.state == MTAState.WAIT_SHUTTER_CLOSE
+        body, *_ = stocked.shutter_timeout()
+        assert body["data"] == {"error_code": "UNCLASSIFIED_ERROR"}
+        assert stocked.state == MTAState.ERROR
 
     def test_retry_is_idempotent(self, stocked, db):
         body, *_ = stocked.sell("COLA")

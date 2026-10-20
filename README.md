@@ -177,21 +177,26 @@ uv run python tests/virtualmta.py run
 
 | Подкоманда | Назначение |
 |---|---|
-| `seed` | добавляет в SQLite автомат, 4 товара (`COLA`, `WATER`, `CHIPS`, `CHOCO`) и нулевые остатки; остатки обязательны, иначе сервер отвечает на `LOAD` 400 «Inventory record not found» |
+| `seed` | добавляет в SQLite автомат, товар `WATER_05` и нулевые остатки; остатки обязательны, иначе сервер отвечает на `LOAD` 400 «Inventory record not found» |
 | `run` | интерактивный режим: сам шлёт только heartbeat (по умолчанию каждые 10 с), события — по клавишам 1–9 |
 
 Клавиши `run` (Enter не нужен; `h` — справка, `q` или Ctrl+C — выход):
 
 | Клавиша | Действие |
 |---|---|
-| `1`–`4` | `SALE`: `COLA`, `WATER`, `CHIPS`, `CHOCO` |
+| `1` | `SALE`: `WATER_05` (единственный товар прошивки) |
 | `5` | `LOAD`: +10 шт. каждого товара (после `seed` остатки нулевые, без загрузки продажи отклоняются) |
 | `6` | повтор последней продажи с тем же `event_id` (ожидается `already_accepted`) |
 | `7` | `ERROR_SET`: следующий неактивный код из `COIN_JAM`, `DISPENSER_STUCK`, `COOLING_FAIL` |
 | `8` | `ERROR_CLEAR`: снять последнюю ошибку |
 | `9` | `UNLOAD`: −1 шт. каждого товара |
+| `d` | сервисная дверь: открыть/закрыть (`SERVICE` ↔ проверка готовности) |
+| `s` | сервисная выдача при открытой двери (без `SALE`) |
+| `e` | датчик следующей банки нет/есть (`EMPTY`) |
 
 Состояние в heartbeat — состояние `VirtualMTA` (`IDLE`, `WAIT_PAYMENT`,
-`DISPENSING`, `SUCCESS`, `ERROR`); при открытой ошибке продажа невозможна.
+`DISPENSING`, `SUCCESS`, `EMPTY`, `SERVICE`, `SERVICE_DISPENSING`,
+`WAIT_CLEAR_DISPENSER`, `WAIT_SHUTTER_CLOSE`, `ERROR`; как в прошивке v0.3.10
+вход в `ERROR` сам шлёт `ERROR_SET`, выход — `ERROR_CLEAR`); при открытой ошибке продажа невозможна.
 Параметр `run`: `--heartbeat` (период, с). Без терминала (pipe) клавиши
 читаются из stdin, на EOF эмулятор завершается.

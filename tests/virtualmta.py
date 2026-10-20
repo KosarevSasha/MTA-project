@@ -41,7 +41,27 @@ class MTAState(enum.StrEnum):
     WAIT_PAYMENT = enum.auto()
     DISPENSING = enum.auto()
     SUCCESS = enum.auto()
+    EMPTY = enum.auto()
+    SERVICE = enum.auto()
+    SERVICE_DISPENSING = enum.auto()
+    WAIT_CLEAR_DISPENSER = enum.auto()
+    WAIT_SHUTTER_CLOSE = enum.auto()
     ERROR = enum.auto()
+
+
+# Коды, которые прошивка (v0.3.10) выставляет сама при входе в ERROR.
+FAULT_DISPENSE_FAILURE = "DISPENSE_FAILURE"
+FAULT_UNCLASSIFIED = "UNCLASSIFIED_ERROR"
+
+# Состояния, из которых открытие сервисной двери ведёт в SERVICE (как в прошивке);
+# из остальных (оплата, выдача, SUCCESS) - в ERROR.
+_DOOR_TO_SERVICE = (
+    MTAState.IDLE,
+    MTAState.EMPTY,
+    MTAState.ERROR,
+    MTAState.WAIT_CLEAR_DISPENSER,
+    MTAState.WAIT_SHUTTER_CLOSE,
+)
 
 
 class VirtualMTA:
@@ -67,6 +87,12 @@ class VirtualMTA:
         self.product_id: str | None = None
         self.session_id: str | None = None
         self.payment_ok = False
+
+        # Датчики и контекст возврата, как в прошивке.
+        self.next_can_present = True
+        self.tray_occupied = False
+        self._return_state = MTAState.IDLE
+        self._fault: str | None = None
 
     # --- транспорт ---------------------------------------------------------
 
@@ -99,7 +125,11 @@ class VirtualMTA:
     # --- сообщения ---------------------------------------------------------
 
     def heartbeat(self) -> tuple[int, Any]:
-        error = self.active_errors[-1] if self.active_errors else "NONE"
+        # Прошивка шлёт UNCLASSIFIED_ERROR для любого ERROR, иначе NONE.
+        if self.active_errors:
+            error = self.active_errors[-1]
+        else:
+            error = FAULT_UNCLASSIFIED if self.state == MTAState.ERROR else "NONE"
         return self.post(
             "/api/v1/device/heartbeat",
             {
@@ -183,7 +213,10 @@ class VirtualMTA:
             self._cancel_session()
 
     def dispense(self, *, success: bool = True) -> tuple[dict, int, Any] | None:
-        """Выдача товара; при успехе отправляет SALE и возвращает (body, status, answer)."""
+        """Выдача товара; при успехе отправляет SALE, при сбое - ERROR_SET.
+
+        Возвращает (body, status, answer) отправленного события.
+        """
         if (price := self.prices.get(self.product_id)) is None:
             raise RuntimeError(
                 f"Unexpected {price=} ({self.product_id=}, {self.prices=})"
@@ -192,9 +225,9 @@ class VirtualMTA:
         self._require_state(MTAState.DISPENSING)
         if not success:
             self._reset_session()
-            self.state = MTAState.ERROR
-            return None
+            return self._transition(MTAState.ERROR)
         self.state = MTAState.SUCCESS
+        self.tray_occupied = True  # банка лежит в лотке до тех пор, пока её не заберут
 
         result = self.event(
             "SALE",
@@ -210,9 +243,13 @@ class VirtualMTA:
         return result
 
     def finish(self) -> None:
-        """Вернуться из SUCCESS в IDLE (или ERROR, если есть открытые ошибки)."""
+        """Клиент забрал банку: SUCCESS -> проверка готовности (или ERROR, если есть ошибки)."""
         self._require_state(MTAState.SUCCESS)
-        self.state = MTAState.ERROR if self.active_errors else MTAState.IDLE
+        self.tray_occupied = False
+        if self.active_errors:
+            self.state = MTAState.ERROR
+        else:
+            self._readiness(MTAState.IDLE)
 
     def sell(self, product_id: str) -> tuple[dict, int, Any]:
         """Полная успешная продажа за один вызов."""
@@ -232,14 +269,115 @@ class VirtualMTA:
         self._reset_session()
         self.state = MTAState.ERROR if self.active_errors else MTAState.IDLE
 
+    # --- состояния прошивки и датчики --------------------------------------
+
+    def _transition(self, new: MTAState) -> tuple[dict, int, Any] | None:
+        """Сменить состояние; ERROR_SET/ERROR_CLEAR шлются как в прошивке."""
+        old, self.state = self.state, new
+        if new == MTAState.ERROR and old != MTAState.ERROR:
+            self._fault = (
+                FAULT_DISPENSE_FAILURE
+                if old == MTAState.DISPENSING
+                else FAULT_UNCLASSIFIED
+            )
+            if self._fault not in self.active_errors:
+                self.active_errors.append(self._fault)
+            return self.event("ERROR_SET", {"error_code": self._fault})
+        if old == MTAState.ERROR and new != MTAState.ERROR and self._fault:
+            fault, self._fault = self._fault, None
+            if fault in self.active_errors:
+                self.active_errors.remove(fault)
+            return self.event("ERROR_CLEAR", {"error_code": fault})
+        return None
+
+    def _readiness(
+        self, requested: MTAState = MTAState.IDLE
+    ) -> tuple[dict, int, Any] | None:
+        """Проверка готовности (без шторки и концевика выхода): EMPTY, лоток, затем цель."""
+        if not self.next_can_present:
+            return self._transition(MTAState.EMPTY)
+        if self.tray_occupied:
+            self._return_state = requested
+            return self._transition(MTAState.WAIT_CLEAR_DISPENSER)
+        return self._transition(requested)
+
+    def set_next_can(self, present: bool) -> tuple[dict, int, Any] | None:
+        """Датчик следующей банки. Из EMPTY выходит только по возвращении банки."""
+        self.next_can_present = present
+        if present and self.state == MTAState.EMPTY:
+            return self._readiness(MTAState.IDLE)
+        return None
+
+    def set_tray(self, occupied: bool) -> tuple[dict, int, Any] | None:
+        """Датчик лотка: банка в лотке блокирует продажу, пока её не заберут."""
+        self.tray_occupied = occupied
+        if occupied and self.state in (MTAState.IDLE, MTAState.WAIT_PAYMENT):
+            self._return_state = self.state
+            return self._transition(MTAState.WAIT_CLEAR_DISPENSER)
+        if not occupied:
+            if self.state == MTAState.SUCCESS:
+                self.finish()
+                return None
+            if self.state == MTAState.WAIT_CLEAR_DISPENSER:
+                return self._readiness(self._return_state)
+        return None
+
+    def open_service_door(self) -> tuple[dict, int, Any] | None:
+        if self.state == MTAState.SERVICE:
+            return None
+        if self.state in _DOOR_TO_SERVICE or self.state == MTAState.SERVICE_DISPENSING:
+            return self._transition(MTAState.SERVICE)
+        self._reset_session()  # оплата/выдача/SUCCESS: дверь открыта некстати
+        return self._transition(MTAState.ERROR)
+
+    def close_service_door(self) -> tuple[dict, int, Any] | None:
+        if self.state == MTAState.SERVICE_DISPENSING:
+            return self._transition(MTAState.ERROR)
+        self._require_state(MTAState.SERVICE)
+        return self._readiness(MTAState.IDLE)
+
+    def service_dispense(self) -> bool:
+        """Сервисная выдача (дверь открыта): без оплаты и без события SALE.
+
+        Условия старта как у короткого нажатия GPIO17: банка есть, лоток пуст.
+        Возвращает True, если мотор запускался; цикл завершается обратно в SERVICE.
+        """
+        self._require_state(MTAState.SERVICE)
+        if not self.next_can_present or self.tray_occupied:
+            return False
+        self.state = MTAState.SERVICE_DISPENSING
+        self.state = MTAState.SERVICE
+        return True
+
+    def shutter_raised(self) -> tuple[dict, int, Any] | None:
+        """Шторку подняли вне выдачи: защитное состояние с зуммером."""
+        if self.state == MTAState.WAIT_CLEAR_DISPENSER:
+            return self._transition(MTAState.WAIT_SHUTTER_CLOSE)
+        if self.state in (
+            MTAState.IDLE,
+            MTAState.WAIT_PAYMENT,
+            MTAState.SUCCESS,
+            MTAState.EMPTY,
+        ):
+            self._return_state = self.state
+            return self._transition(MTAState.WAIT_SHUTTER_CLOSE)
+        return None
+
+    def shutter_lowered(self) -> tuple[dict, int, Any] | None:
+        if self.state == MTAState.WAIT_SHUTTER_CLOSE:
+            return self._readiness(self._return_state)
+        return None
+
+    def shutter_timeout(self) -> tuple[dict, int, Any] | None:
+        """15 секунд шторка не закрыта: ERROR (UNCLASSIFIED_ERROR)."""
+        self._require_state(MTAState.WAIT_SHUTTER_CLOSE)
+        return self._transition(MTAState.ERROR)
+
 
 # --- интерактивный эмулятор ---------------------------------------------
 
 DEFAULT_PRODUCTS = {
-    "COLA": ("Cola 0.5L", 150),
-    "WATER": ("Water 0.5L", 80),
-    "CHIPS": ("Chips", 120),
-    "CHOCO": ("Chocolate bar", 100),
+    "WATER_05": ("Water 0.5L", 80),  # единственный товар прошивки v0.3.10
 }
 ERROR_CODES = ("COIN_JAM", "DISPENSER_STUCK", "COOLING_FAIL")
 LOAD_QUANTITY = 10
@@ -296,16 +434,37 @@ def report(label, result):
     log("{:<12} -> {} {}".format(label, status, answer))
 
 
-PRODUCT_KEYS = dict(zip("1234", DEFAULT_PRODUCTS))
+PRODUCT_KEYS = dict(zip("1", DEFAULT_PRODUCTS))
 HELP = """\
 клавиши (Enter не нужен):
-  1-4  SALE: COLA, WATER, CHIPS, CHOCO
+  1    SALE: WATER_05
   5    LOAD: +{} шт. каждого товара
   6    повтор последней продажи (тот же event_id)
   7    ERROR_SET: следующий код из {}
   8    ERROR_CLEAR: снять последнюю ошибку
   9    UNLOAD: -1 шт. каждого товара
+  d    сервисная дверь открыть/закрыть
+  s    сервисная выдача (дверь открыта)
+  e    датчик следующей банки: нет/есть (EMPTY)
   h    эта справка, q - выход""".format(LOAD_QUANTITY, ", ".join(ERROR_CODES))
+
+
+def handle_hardware_key(machine, key):
+    if key == "d":
+        if machine.state in (MTAState.SERVICE, MTAState.SERVICE_DISPENSING):
+            result, label = machine.close_service_door(), "door closed"
+        else:
+            result, label = machine.open_service_door(), "door open"
+    elif key == "s":
+        started = machine.service_dispense()
+        log("service dispense: {}".format("выдано" if started else "условия не выполнены"))
+        return
+    else:
+        result = machine.set_next_can(not machine.next_can_present)
+        label = "next can " + ("present" if machine.next_can_present else "absent")
+    log("{} -> state={}".format(label, machine.state))
+    if result:
+        report("  " + result[0]["event_type"], result)
 
 
 def handle_key(machine, key, last_sale):
@@ -350,6 +509,11 @@ def handle_key(machine, key, last_sale):
     elif key == "9":
         for product_id in DEFAULT_PRODUCTS:
             report("UNLOAD " + product_id, machine.unload(product_id, 1))
+    elif key in ("d", "s", "e"):
+        try:
+            handle_hardware_key(machine, key)
+        except RuntimeError as error:
+            log("действие невозможно: {}".format(error))
     return last_sale
 
 
