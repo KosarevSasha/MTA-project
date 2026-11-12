@@ -1,0 +1,21 @@
+[Unit]
+Description=MTA FastAPI Server
+After=network.target
+
+[Service]
+Type=simple
+User=mtaadmin
+Group=mtaadmin
+WorkingDirectory=/home/mtaadmin/mta-server
+ExecStart=/home/mtaadmin/mta-server/.venv/bin/server --env-file /etc/mta/mta.env
+Restart=on-failure
+RestartSec=5
+
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=false
+PrivateTmp=true
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target
