@@ -94,3 +94,51 @@ Store the backup of /etc/mta/mta.env securely, with restricted
 access. Never place it in Git.
 
 A tested restore procedure must be prepared before production use.
+
+## Automated database backups
+
+SQLite backups are managed by systemd.
+
+Files:
+- deploy/scripts/backup_mta.sh
+- deploy/mta-backup.service
+- deploy/mta-backup.timer
+
+Schedule:
+- Daily at 03:00 Europe/Moscow
+- Persistent=true runs missed jobs after timer activation
+
+Retention:
+- Keep the 7 most recent timestamped database backups
+- Preserve mta-first-backup.db separately
+
+Backup procedure:
+1. Acquire an exclusive flock lock.
+2. Create a consistent SQLite backup.
+3. Run integrity_check and foreign_key_check.
+4. Publish the verified backup without overwriting existing files.
+5. Remove old timestamped backups after successful creation.
+
+Install units:
+
+    sudo install -o root -g root -m 644 deploy/mta-backup.service /etc/systemd/system/
+    sudo install -o root -g root -m 644 deploy/mta-backup.timer /etc/systemd/system/
+    sudo systemctl daemon-reload
+    sudo systemctl enable --now mta-backup.timer
+
+Manual backup:
+
+    sudo systemctl start mta-backup.service
+
+Check timer:
+
+    systemctl status mta-backup.timer --no-pager
+
+Check backup logs:
+
+    sudo journalctl -u mta-backup.service -n 30 --no-pager
+
+Important:
+- Backups are currently stored on the same VPS.
+- Off-server backup storage is still required.
+- The configuration backup is managed separately.

@@ -1,0 +1,15 @@
+[Unit]
+Description=MTA SQLite Database Backup
+
+[Service]
+Type=oneshot
+User=mtaadmin
+Group=mtaadmin
+WorkingDirectory=/home/mtaadmin/mta-server
+ExecStart=/usr/bin/bash /home/mtaadmin/mta-server/deploy/scripts/backup_mta.sh
+
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=false
+PrivateTmp=true
+UMask=0077

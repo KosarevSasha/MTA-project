@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily MTA SQLite Backup
+
+[Timer]
+OnCalendar=*-*-* 03:00:00 Europe/Moscow
+Persistent=true
+Unit=mta-backup.service
+
+[Install]
+WantedBy=timers.target
